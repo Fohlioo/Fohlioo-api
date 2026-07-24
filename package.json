@@ -1,0 +1,29 @@
+{
+  "name": "fohlioo-api",
+  "version": "0.1.0",
+  "description": "Fohlioo event ingestion API — receives behavioural signals from the Chrome extension and writes them to Supabase",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch --env-file=.env src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.7",
+    "@supabase/supabase-js": "^2.45.4",
+    "hono": "^4.6.9",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3",
+    "vitest": "^4.1.10"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
