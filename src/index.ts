@@ -2,6 +2,7 @@ import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
+import auth from "./routes/auth";
 import events from "./routes/events";
 import shoppers from "./routes/shoppers";
 
@@ -11,7 +12,7 @@ if (!INGEST_API_KEY) {
   throw new Error(
     "Missing INGEST_API_KEY environment variable. " +
       "Copy .env.example to .env and set a long random secret — the extension " +
-      "sends it in the x-fohlioo-key header on every request."
+      "sends it in the x-fohlioo-key header on event and shopper requests."
   );
 }
 
@@ -27,15 +28,20 @@ app.use(
   cors({
     origin: "*",
     allowMethods: ["GET", "POST"],
-    allowHeaders: ["Content-Type", "x-fohlioo-key"],
+    allowHeaders: ["Content-Type", "x-fohlioo-key", "Authorization"],
   })
 );
 
-// Shared-secret auth on everything under /api. Appropriate for the beta:
-// the key lives only in the extension's background worker and this server's
-// environment. Replace with per-shopper tokens once Supabase Auth lands.
+const INGEST_KEY_PATHS = ["/api/v1/events", "/api/v1/shoppers"];
+
+// Shared-secret on ingest + shopper reads. Auth exchange is exempt — the
+// one-time code is the credential, and the extension does not send the key.
 app.use("/api/*", async (c, next) => {
-  if (c.req.header("x-fohlioo-key") !== INGEST_API_KEY) {
+  const path = c.req.path;
+  const needsIngestKey = INGEST_KEY_PATHS.some(
+    (prefix) => path === prefix || path.startsWith(`${prefix}/`)
+  );
+  if (needsIngestKey && c.req.header("x-fohlioo-key") !== INGEST_API_KEY) {
     return c.json({ ok: false, error: "unauthorized" }, 401);
   }
   await next();
@@ -44,10 +50,11 @@ app.use("/api/*", async (c, next) => {
 app.get("/", (c) => c.json({ service: "fohlioo-api", status: "ok" }));
 app.get("/health", (c) => c.json({ status: "ok", time: new Date().toISOString() }));
 
+app.route("/api/v1/auth", auth);
 app.route("/api/v1/events", events);
 app.route("/api/v1/shoppers", shoppers);
 
-const port = Number(process.env.PORT) || 3000;
+const port = Number(process.env.PORT) || 8080;
 
 serve({ fetch: app.fetch, port }, (info) => {
   console.log(`fohlioo-api listening on http://localhost:${info.port}`);

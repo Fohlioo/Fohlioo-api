@@ -24,17 +24,35 @@ function resolveOccurredAt(clientTimestamp: number | undefined): string {
 }
 
 /**
- * Resolves each unique extension_id in the batch to its internal shopper
- * uuid in a single upsert round trip. Upsert on extension_id keeps this
- * idempotent — repeated calls for the same install return the same shopper.
+ * Resolves each unique extension_id to its canonical shopper uuid.
+ * Prefer shopper_installs so a second-browser install that was merged
+ * at sign-in still writes events onto the same shopper.
  */
 async function resolveShopperIds(
   extensionIds: string[]
 ): Promise<Map<string, string>> {
+  const resolved = new Map<string, string>();
+
+  const { data: installs, error: installError } = await supabase
+    .from("shopper_installs")
+    .select("extension_id, shopper_id")
+    .in("extension_id", extensionIds);
+
+  if (installError) {
+    throw new Error(`Failed to resolve installs: ${installError.message}`);
+  }
+
+  for (const row of installs ?? []) {
+    resolved.set(row.extension_id as string, row.shopper_id as string);
+  }
+
+  const missing = extensionIds.filter((id) => !resolved.has(id));
+  if (missing.length === 0) return resolved;
+
   const { data, error } = await supabase
     .from("shoppers")
     .upsert(
-      extensionIds.map((extension_id) => ({ extension_id })),
+      missing.map((extension_id) => ({ extension_id })),
       { onConflict: "extension_id" }
     )
     .select("id, extension_id");
@@ -43,7 +61,23 @@ async function resolveShopperIds(
     throw new Error(`Failed to resolve shoppers: ${error?.message}`);
   }
 
-  return new Map(data.map((row) => [row.extension_id as string, row.id as string]));
+  const { error: mapError } = await supabase.from("shopper_installs").upsert(
+    data.map((row) => ({
+      extension_id: row.extension_id as string,
+      shopper_id: row.id as string,
+    })),
+    { onConflict: "extension_id" }
+  );
+
+  if (mapError) {
+    throw new Error(`Failed to record installs: ${mapError.message}`);
+  }
+
+  for (const row of data) {
+    resolved.set(row.extension_id as string, row.id as string);
+  }
+
+  return resolved;
 }
 
 function toEventRow(shopperId: string, event: IncomingEvent) {

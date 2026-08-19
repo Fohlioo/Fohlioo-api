@@ -5,10 +5,13 @@
 create extension if not exists "uuid-ossp";
 create extension if not exists vector; -- needed later for AWIN catalogue embeddings, enable now to avoid a second migration
 
--- Shoppers: one row per extension install. Anonymous until email is set.
+-- Shoppers: one row per person. Anonymous until a Supabase Auth user is linked.
+-- extension_id is the first install that created the row; later installs for
+-- the same account are recorded in shopper_installs so ingest still resolves.
 create table if not exists shoppers (
   id uuid primary key default gen_random_uuid(),
   extension_id text unique not null,
+  user_id uuid unique references auth.users(id),
   email text unique,
   segment text not null default 'unclassified' check (segment in (
     'investment_dresser',
@@ -82,6 +85,41 @@ create table if not exists segment_history (
 
 create index if not exists idx_segment_history_shopper on segment_history (shopper_id, computed_at);
 
+-- Maps every extension install to a canonical shopper. Lets a second browser
+-- keep sending events after auth merge moved them onto an existing user row.
+create table if not exists shopper_installs (
+  extension_id text primary key,
+  shopper_id uuid references shoppers(id) on delete cascade not null,
+  created_at timestamptz default now()
+);
+
+create index if not exists idx_shopper_installs_shopper on shopper_installs (shopper_id);
+
+insert into shopper_installs (extension_id, shopper_id)
+select extension_id, id from shoppers
+on conflict (extension_id) do nothing;
+
+-- One-time codes the webapp writes after login; this API consumes them on
+-- POST /api/v1/auth/exchange. 60s expiry is enforced in the webapp insert
+-- and re-checked here.
+create table if not exists extension_auth_codes (
+  code text primary key,
+  user_id uuid references auth.users(id) not null,
+  extension_id text not null,
+  expires_at timestamptz not null,
+  used boolean default false,
+  created_at timestamptz default now()
+);
+
+-- App-level user record. The webapp fills this on signup; exchange does not.
+create table if not exists profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  role text not null default 'shopper' check (role in ('shopper', 'brand')),
+  first_name text,
+  marketing_opt_in boolean default false,
+  created_at timestamptz default now()
+);
+
 -- Bumps a shopper's activity counters in one round trip after a batch insert.
 create or replace function increment_shopper_activity(p_shopper_id uuid, p_count int)
 returns void
@@ -101,3 +139,6 @@ alter table shoppers enable row level security;
 alter table events enable row level security;
 alter table shopper_signals enable row level security;
 alter table segment_history enable row level security;
+alter table shopper_installs enable row level security;
+alter table extension_auth_codes enable row level security;
+alter table profiles enable row level security;

@@ -73,3 +73,10 @@ export const eventBatchSchema = z.object({
 });
 
 export type IncomingEventBatch = z.infer<typeof eventBatchSchema>;
+
+export const authExchangeSchema = z.object({
+  code: z.string().min(1),
+  extension_id: z.string().min(1),
+});
+
+export type AuthExchangeRequest = z.infer<typeof authExchangeSchema>;

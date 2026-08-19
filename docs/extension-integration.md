@@ -1,55 +1,76 @@
 # Extension ↔ API integration contract
 
-This document is the hand-off for wiring the extension's empty `lib/api.ts`
-to this backend. Extension-side changes live in
-[Fohlioo-extension](https://github.com/Fohlioo/Fohlioo-extension); this repo
-only defines the contract.
+How the Chrome extension talks to this API. Capture still lives in the
+extension; this backend stores events, derives signals, and (now) attaches
+an anonymous install to a signed-in user.
 
-## Auth
+Locally the API listens on **8080** so it does not collide with fohlioo-app
+on 3000. Set `PLASMO_PUBLIC_API_URL=http://localhost:8080`.
 
-Every `/api/v1/*` request must include:
+## Auth: two different credentials
 
-```
-x-fohlioo-key: <INGEST_API_KEY>
-```
+| Route | Credential | Why |
+|-------|------------|-----|
+| `POST /api/v1/events` and `/batch` | `x-fohlioo-key: <INGEST_API_KEY>` | Stops strangers flooding the event log. Anonymous browsing still works — the shopper is identified by `extension_id`, not a login. |
+| `GET /api/v1/shoppers/:extension_id` | same ingest key | Same |
+| `POST /api/v1/auth/exchange` | **none** (JSON `{ code, extension_id }` only) | The one-time code *is* the secret. The extension does not send the ingest key here. |
+| `GET /health` | none | Liveness |
 
-The key is a shared secret. Store it only in the extension **background
-worker** (never in a content script, never in `PLASMO_PUBLIC_*` env vars that
-get bundled into page context). Missing or wrong key → `401`.
+Optional on event routes: `Authorization: Bearer <access_token>` after sign-in. The API does not require it for ingest. CORS allows that header.
+
+Store `PLASMO_API_KEY` only in the extension **background worker** (never `PLASMO_PUBLIC_*`).
 
 ## Anonymous shopper identity
 
-The API keys shoppers by `extension_id`, not by email/auth.
+On first run the extension generates a UUID and keeps it in
+`chrome.storage.local` under `extension_id`. Sign-in and sign-out must
+never regenerate it.
 
-On first run, the extension should generate a UUID and persist it in
-`chrome.storage.local`:
-
-```ts
-async function getOrCreateExtensionId(): Promise<string> {
-  const { extensionId } = await chrome.storage.local.get("extensionId")
-  if (typeof extensionId === "string" && extensionId.length > 0) {
-    return extensionId
-  }
-  const id = crypto.randomUUID()
-  await chrome.storage.local.set({ extensionId: id })
-  return id
-}
-```
-
-Send that same value on every event. The API upserts a `shoppers` row on
-first sight and reuses it forever.
+Every event includes that id. The API upserts a `shoppers` row and a
+`shopper_installs` row. After the user signs in, `shoppers.user_id` is set
+and browsing history stays attached to the same person.
 
 ## Endpoints
 
-Base URL: `process.env.PLASMO_PUBLIC_API_URL` (e.g. `http://localhost:3000`
-in development, Railway URL in production).
-
 | Method | Path | Purpose |
 |--------|------|---------|
+| `POST` | `/api/v1/auth/exchange` | One-time code → Supabase tokens + shopper merge |
 | `POST` | `/api/v1/events` | Single event |
 | `POST` | `/api/v1/events/batch` | Up to 100 events (preferred) |
 | `GET`  | `/api/v1/shoppers/:extension_id` | Profile + segment + signals |
 | `GET`  | `/health` | Liveness (no auth) |
+
+Signals already recompute after every successful ingest. Auth does not
+recompute them except when a second install is merged onto an existing
+account.
+
+## Auth exchange
+
+The webapp (not this repo) creates a row in `extension_auth_codes` after
+login. The extension then:
+
+```
+POST /api/v1/auth/exchange
+{ "code": "<one-time>", "extension_id": "<uuid>" }
+```
+
+Success (this shape is what the extension already parses):
+
+```json
+{
+  "access_token": "...",
+  "refresh_token": "...",
+  "user_id": "...",
+  "expires_at": 1234567890000
+}
+```
+
+`expires_at` is unix milliseconds. Invalid / used / expired / mismatched
+codes return `401`. Token mint failure returns `500` and never invents JWTs.
+
+Until the webapp writes codes, you can smoke-test by inserting a row in
+the SQL editor (use a real `auth.users` id, expiry ~60s from now) and
+curling the endpoint.
 
 ## Event body
 
@@ -88,11 +109,7 @@ type IncomingEvent = {
 }
 ```
 
-Batch:
-
-```ts
-{ events: IncomingEvent[] } // 1–100
-```
+Batch: `{ events: IncomingEvent[] }` (1–100).
 
 ## Mapping from extension messages
 
@@ -112,18 +129,13 @@ if batches flush late.
 
 ## Flush strategy
 
-1. Queue events in memory (or `chrome.storage.local`) after each
-   `applySessionUpdate`.
-2. Flush via `POST /api/v1/events/batch` every few seconds, on
-   `visibilitychange` → hidden, and on extension suspend if possible.
-3. On network failure: keep the queue and retry. Never block the popup or
-   content script on API errors.
-
-Example shape for `lib/api.ts`:
+1. Queue events in `chrome.storage.local` after each session update.
+2. Flush via `POST /api/v1/events/batch` every few seconds and on suspend.
+3. On network failure: keep the queue and retry. Never block the popup.
 
 ```ts
 const API_URL = process.env.PLASMO_PUBLIC_API_URL
-const API_KEY = process.env.PLASMO_API_KEY // background-only, not PLASMO_PUBLIC_
+const API_KEY = process.env.PLASMO_API_KEY // background-only
 
 export async function flushEvents(events: IncomingEvent[]): Promise<void> {
   if (!API_URL || events.length === 0) return
@@ -155,13 +167,11 @@ GET /api/v1/shoppers/:extension_id
 
 `segment` is one of `investment_dresser | trend_chaser | quiet_minimalist |
 brand_loyalist | unclassified`. Below 10 events the shopper stays
-`unclassified` with confidence `0` — do not show that as a real style mix
-in the popup.
+`unclassified` with confidence `0`.
 
 ## What happens server-side after ingest
 
-1. Upsert shopper(s) by `extension_id`
-2. Insert all events in one round trip
+1. Resolve shopper via `shopper_installs`, or create one
+2. Insert events
 3. Increment `shoppers.event_count` / set `last_active_at`
 4. Asynchronously recompute `shopper_signals` and reclassify the segment
-   (never blocks the HTTP response)
